@@ -1,185 +1,528 @@
-import random
-import torch
-import os
-import stanza
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+复现 dev100 的原始扰动流程，并支持 train/dev/test 任意 split。
+
+保持不变的实验设计
+------------------
+1. Stanza dependency delete:
+   deprel in {advmod, amod, obj}，随机删除长度 > 1 的词。
+2. Connective delete:
+   从原代码给定连接词表中随机删除一个。
+3. Punctuation:
+   从固定标点替换对中随机选择。
+4. BERT lexical replace:
+   使用 bert-base-chinese MLM 替换一个汉字。
+5. 每个 topic 共用同一个五槽 plan：
+   dependency_delete, connective_delete, punctuation,
+   lexical_replace, random choice of four types.
+6. random.seed(42), torch.manual_seed(42)。
+
+后续纠错脚本会删除 lexical_replace，因此正式路径中每个 source
+最终保留 3 或 4 个扰动，且同一 topic 的 human/machine 数量一致。
+"""
+
+import argparse
 import json
-from transformers import BertTokenizer, BertForMaskedLM
+import random
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import stanza
+import torch
 from tqdm import tqdm
-
-# ========== 初始化 Stanza ==========
-MODEL_DIR = '/root/autodl-tmp/9/923/default'
-nlp = stanza.Pipeline(
-    lang='zh',
-    processors='tokenize,pos,lemma,depparse',
-    dir=MODEL_DIR,
-    download_method=None,
-    tokenize_model_path=f"{MODEL_DIR}/tokenize/gsdsimp.pt",
-    pos_model_path=f"{MODEL_DIR}/pos/gsdsimp.pt",
-    depparse_model_path=f"{MODEL_DIR}/depparse/gsdsimp.pt",
-    verbose=False
-)
+from transformers import BertForMaskedLM, BertTokenizer
 
 
-# ========== 依存关系扰动 ==========
-def dependency_based_perturbation(text, debug=False):
-    doc = nlp(text)
-    if not doc.sentences:
-        return text
-    words = doc.sentences[0].words
-    word_list = [w.text for w in words]
-    rules = ["advmod", "obj", "amod"]
-
-    def apply_rule(rule):
-        perturbed = word_list.copy()
-        if rule == "advmod":
-            advs = [w.text for w in words if w.deprel == "advmod"]
-            if advs:
-                adv = random.choice(advs)
-                perturbed.remove(adv)
-                perturbed.insert(0, adv) if random.random() < 0.5 else perturbed.append(adv)
-        elif rule == "obj":
-            objs = [w.text for w in words if w.deprel == "obj"]
-            if objs:
-                obj = random.choice(objs)
-                perturbed.remove(obj)
-                perturbed.insert(0, obj) if random.random() < 0.5 else perturbed.append(obj)
-        elif rule == "amod":
-            mods = [w.text for w in words if w.deprel in ["amod", "nummod"]]
-            if mods:
-                mod = random.choice(mods)
-                perturbed.remove(mod)
-                perturbed.insert(0, mod) if random.random() < 0.5 else perturbed.append(mod)
-        return ''.join(perturbed)
-
-    tried = []
-    perturbed_text = text
-    for _ in range(3):
-        remaining = [r for r in rules if r not in tried]
-        if not remaining:
-            break
-        rule = random.choice(remaining)
-        tried.append(rule)
-        perturbed_text = apply_rule(rule)
-        if perturbed_text != text:
-            return perturbed_text
-
-    return text
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ========== BERT 多词掩码 + top-k ==========
-def bert_multi_mask_replacement(text, model, tokenizer, num_masks=2, top_k=10, temperature=1.0):
-    model.eval()
-    input_ids = tokenizer.encode(text, return_tensors="pt", add_special_tokens=True).cuda()
-    length = input_ids.size(1)
-    mask_count = min(num_masks, max(1, length - 2))
-    masked_positions = random.sample(range(1, length - 1), mask_count)
-    perturbed_ids = input_ids.clone()
-    for pos in masked_positions:
-        perturbed_ids[0, pos] = tokenizer.mask_token_id
+def load_jsonl(path):
+    rows = []
+
+    with open(path, "r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                rows.append(json.loads(line))
+            except Exception as exc:
+                raise ValueError(
+                    f"第 {line_number} 行不是合法 JSON：{exc}"
+                ) from exc
+
+    return rows
+
+
+def save_jsonl(rows, path):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with target.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(
+                json.dumps(row, ensure_ascii=False) + "\n"
+            )
+
+
+def build_stanza_pipeline(stanza_dir, stanza_package):
+    return stanza.Pipeline(
+        lang="zh",
+        processors="tokenize,pos,lemma,depparse",
+        dir=stanza_dir,
+        package=stanza_package,
+        download_method=None,
+        verbose=False,
+    )
+
+
+def dependency_delete(text, nlp):
+    document = nlp(text)
+    words = []
+
+    for sentence in document.sentences:
+        words.extend(sentence.words)
+
+    candidates = []
+
+    for word in words:
+        if word.deprel in ["advmod", "amod", "obj"]:
+            if len(word.text) > 1:
+                candidates.append(word.text)
+
+    if not candidates:
+        return text, False
+
+    target = random.choice(candidates)
+
+    new_text = text.replace(
+        target,
+        "",
+        1,
+    )
+
+    if new_text != text:
+        return new_text, True
+
+    return text, False
+
+
+def connective_delete(text):
+    connectives = [
+        "但是",
+        "然而",
+        "所以",
+        "因此",
+        "然后",
+        "其实",
+        "另外",
+        "同时",
+        "可能",
+        "一般来说",
+        "总的来说",
+    ]
+
+    candidates = [
+        connective
+        for connective in connectives
+        if connective in text
+    ]
+
+    if not candidates:
+        return text, False
+
+    target = random.choice(candidates)
+
+    new_text = text.replace(
+        target,
+        "",
+        1,
+    )
+
+    return new_text, True
+
+
+def punctuation_perturb(text):
+    pairs = [
+        ("。", "，"),
+        ("，", "。"),
+        ("！", "。"),
+        ("？", "。"),
+    ]
+
+    candidates = [
+        pair
+        for pair in pairs
+        if pair[0] in text
+    ]
+
+    if not candidates:
+        return text, False
+
+    source_punctuation, target_punctuation = random.choice(
+        candidates
+    )
+
+    new_text = text.replace(
+        source_punctuation,
+        target_punctuation,
+        1,
+    )
+
+    return new_text, True
+
+
+def bert_replace(
+    text,
+    model,
+    tokenizer,
+    top_k=10,
+):
+    encoded = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    )
+
+    input_ids = encoded["input_ids"].to(DEVICE)
+
+    tokens = tokenizer.convert_ids_to_tokens(
+        input_ids[0]
+    )
+
+    candidates = []
+
+    for index, token in enumerate(tokens):
+        if (
+            len(token) == 1
+            and "\u4e00" <= token <= "\u9fff"
+            and token not in ["的", "了", "是", "我", "你"]
+        ):
+            candidates.append(index)
+
+    if not candidates:
+        return text, False
+
+    position = random.choice(candidates)
+    masked_ids = input_ids.clone()
+    masked_ids[0, position] = tokenizer.mask_token_id
+
     with torch.no_grad():
-        outputs = model(perturbed_ids)
-        logits = outputs.logits
-    for pos in masked_positions:
-        logits_pos = logits[0, pos] / temperature
-        probs = torch.softmax(logits_pos, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, k=top_k)
-        sampled_id = random.choices(topk_indices.tolist(), weights=topk_probs.tolist(), k=1)[0]
-        perturbed_ids[0, pos] = sampled_id
-    perturbed_text = tokenizer.decode(perturbed_ids[0], skip_special_tokens=True)
-    return perturbed_text
+        output = model(masked_ids)
+
+    probabilities = torch.softmax(
+        output.logits[0, position],
+        dim=-1,
+    )
+
+    values, indices = torch.topk(
+        probabilities,
+        k=top_k,
+    )
+
+    new_token_id = random.choices(
+        indices.tolist(),
+        weights=values.tolist(),
+        k=1,
+    )[0]
+
+    masked_ids[0, position] = new_token_id
+
+    new_tokens = tokenizer.convert_ids_to_tokens(
+        masked_ids[0]
+    )
+
+    result = []
+
+    for token in new_tokens:
+        if token in ["[CLS]", "[SEP]"]:
+            continue
+
+        result.append(
+            token.replace("##", "")
+        )
+
+    new_text = "".join(result)
+
+    if "[UNK]" in new_text:
+        return text, False
+
+    if new_text != text:
+        return new_text, True
+
+    return text, False
 
 
+def apply_perturb(
+    text,
+    perturb_type,
+    nlp,
+    model,
+    tokenizer,
+):
+    if perturb_type == "dependency_delete":
+        return dependency_delete(text, nlp)
 
-def random_swap(text):
-    chars = list(text)
-    if len(chars) > 1:
-        i, j = random.sample(range(len(chars)), 2)
-        chars[i], chars[j] = chars[j], chars[i]
-    return ''.join(chars)
+    if perturb_type == "connective_delete":
+        return connective_delete(text)
 
+    if perturb_type == "punctuation":
+        return punctuation_perturb(text)
 
-def random_deletion(text):
-    chars = list(text)
-    if len(chars) > 1:
-        chars.pop(random.randrange(len(chars)))
-    return ''.join(chars)
+    if perturb_type == "lexical_replace":
+        return bert_replace(
+            text,
+            model,
+            tokenizer,
+        )
 
-
-def random_insertion(text):
-    chars = list(text)
-    if not chars:
-        return text
-    insert_char = random.choice(chars)
-    pos = random.randint(0, len(chars))
-    chars.insert(pos, insert_char)
-    return ''.join(chars)
-
-
-# ========== 综合扰动 ==========
-def perturb_texts_extended(texts, model, tokenizer, typo_dict=None, strength=1):
-    perturbed_texts = []
-    pool_light = ["bert_multi_mask", "dependency_based", "spelling_error", "random_swap", "random_insertion"]
-    pool_heavy = pool_light + ["sentence_reconstruction", "random_deletion"]
-
-    for text in texts:
-        perturbed_text = text
-        if strength == 1:
-            perturb_type_list = random.sample(pool_light, 1)
-        elif strength == 2:
-            perturb_type_list = random.sample(pool_light, 2)
-        else:
-            perturb_type_list = random.sample(pool_heavy, 3)
-
-        for perturb_type in perturb_type_list:
-            if perturb_type == "bert_multi_mask":
-                perturbed_text = bert_multi_mask_replacement(perturbed_text, model, tokenizer,
-                                                             num_masks=2, top_k=10, temperature=1.2)
-            elif perturb_type == "dependency_based":
-                perturbed_text = dependency_based_perturbation(perturbed_text)
-            elif perturb_type == "spelling_error" and typo_dict:
-                for k, v in typo_dict.items():
-                    if k in perturbed_text:
-                        perturbed_text = perturbed_text.replace(k, random.choice(v), 1)
-                        break
-            elif perturb_type == "random_swap":
-                perturbed_text = random_swap(perturbed_text)
-            elif perturb_type == "random_insertion":
-                perturbed_text = random_insertion(perturbed_text)
-            elif perturb_type == "random_deletion":
-                perturbed_text = random_deletion(perturbed_text)
-            elif perturb_type == "sentence_reconstruction":
-                perturbed_text = ''.join(random.sample(list(perturbed_text), len(perturbed_text)))
-
-        perturbed_texts.append(perturbed_text)
-
-    return perturbed_texts
+    raise ValueError(
+        f"未知扰动类型：{perturb_type}"
+    )
 
 
-# ========== 主程序：对 JSON 文件进行扰动 ==========
+def generate_plan():
+    perturb_types = [
+        "dependency_delete",
+        "connective_delete",
+        "punctuation",
+        "lexical_replace",
+    ]
+
+    return [
+        "dependency_delete",
+        "connective_delete",
+        "punctuation",
+        "lexical_replace",
+        random.choice(perturb_types),
+    ]
+
+
+def validate_input_pairs(data):
+    topics = defaultdict(list)
+
+    for item in data:
+        topics[item["topic_id"]].append(item)
+
+    invalid_topics = []
+
+    for topic_id, items in topics.items():
+        label_counts = Counter(
+            str(item["source_label"]).strip().lower()
+            for item in items
+        )
+
+        if (
+            len(items) != 2
+            or label_counts["human"] != 1
+            or label_counts["machine"] != 1
+        ):
+            invalid_topics.append(
+                (topic_id, dict(label_counts), len(items))
+            )
+
+    if invalid_topics:
+        raise ValueError(
+            "输入中存在非严格配对 topic，示例："
+            f"{invalid_topics[:20]}"
+        )
+
+    return topics
+
+
+def validate_output_sync(outputs):
+    signatures = defaultdict(
+        lambda: defaultdict(list)
+    )
+
+    for row in outputs:
+        signatures[
+            row["topic_id"]
+        ][
+            row["source_label"]
+        ].append(
+            (
+                int(row["perturb_id"]),
+                row["perturb_type"],
+            )
+        )
+
+    mismatches = []
+
+    for topic_id, by_label in signatures.items():
+        if by_label["human"] != by_label["machine"]:
+            mismatches.append(topic_id)
+
+    if mismatches:
+        raise RuntimeError(
+            "human/machine 扰动计划不同："
+            f"{mismatches[:20]}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--input_path",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--output_path",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--stanza_dir",
+        default="/home/chy/1/sta",
+    )
+
+    parser.add_argument(
+        "--stanza_package",
+        default="gsdsimp",
+    )
+
+    parser.add_argument(
+        "--bert_path",
+        default="/home/chy/1/bert-base-chinese",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    print("[INFO] device:", DEVICE)
+    print("[INFO] loading Stanza")
+
+    nlp = build_stanza_pipeline(
+        args.stanza_dir,
+        args.stanza_package,
+    )
+
+    print("[INFO] loading BERT tokenizer/model")
+
+    tokenizer = BertTokenizer.from_pretrained(
+        args.bert_path,
+        local_files_only=True,
+    )
+
+    model = BertForMaskedLM.from_pretrained(
+        args.bert_path,
+        local_files_only=True,
+    )
+
+    model.to(DEVICE)
+    model.eval()
+
+    data = load_jsonl(args.input_path)
+    topics = validate_input_pairs(data)
+
+    print("[INFO] input rows:", len(data))
+    print("[INFO] topics:", len(topics))
+
+    outputs = []
+    plan_counts = Counter()
+    success_counts = Counter()
+
+    for topic_id, items in tqdm(
+        topics.items(),
+        desc="Perturb pairs",
+    ):
+        plan = generate_plan()
+        plan_counts.update(plan)
+
+        for item in items:
+            source_text = item["source_text"]
+
+            for perturb_id, perturb_type in enumerate(
+                plan,
+                start=1,
+            ):
+                new_text, success = apply_perturb(
+                    source_text,
+                    perturb_type,
+                    nlp,
+                    model,
+                    tokenizer,
+                )
+
+                row = item.copy()
+                row["perturb_id"] = perturb_id
+                row["perturb_type"] = perturb_type
+                row["perturb_success"] = bool(success)
+                row["perturbed_text"] = new_text
+                row["perturb_seed"] = args.seed
+                row["perturb_generator"] = (
+                    "original_stanza_bert_sync"
+                )
+
+                outputs.append(row)
+
+                success_counts[
+                    (
+                        perturb_type,
+                        bool(success),
+                    )
+                ] += 1
+
+    validate_output_sync(outputs)
+    save_jsonl(outputs, args.output_path)
+
+    allowed_types = {
+        "dependency_delete",
+        "connective_delete",
+        "punctuation",
+    }
+
+    after_filter_count = sum(
+        row["perturb_type"] in allowed_types
+        for row in outputs
+    )
+
+    per_source_after_filter = Counter()
+    valid_by_sample = defaultdict(int)
+
+    for row in outputs:
+        if row["perturb_type"] in allowed_types:
+            valid_by_sample[row["sample_id"]] += 1
+
+    per_source_after_filter.update(
+        valid_by_sample.values()
+    )
+
+    print("[INFO] plan type counts:", dict(plan_counts))
+    print(
+        "[INFO] success counts:",
+        {
+            f"{ptype}:{success}": count
+            for (ptype, success), count
+            in success_counts.items()
+        },
+    )
+    print("[INFO] output rows:", len(outputs))
+    print(
+        "[INFO] rows after lexical filter:",
+        after_filter_count,
+    )
+    print(
+        "[INFO] retained perturbations per source:",
+        dict(per_source_after_filter),
+    )
+    print("[SAVE]", args.output_path)
+
+
 if __name__ == "__main__":
-    tokenizer = BertTokenizer.from_pretrained('/root/autodl-tmp/9/923/bert-base-chinese')
-    model = BertForMaskedLM.from_pretrained('/root/autodl-tmp/9/923/bert-base-chinese').cuda()
-
-    with open("/root/autodl-tmp/9/923/final_typo_dict.json", "r", encoding="utf-8") as f:
-        typo_dict = json.load(f)
-
-    input_path = input("请输入待扰动的 JSON 文件路径：").strip()
-    output_path = input("请输入输出文件路径：").strip()
-    strength = int(input("请输入扰动强度 (1=轻度, 2=中度, 3=重度): ").strip())
-
-    with open(input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    texts = [item["text"] for item in data]
-    perturbed_texts = perturb_texts_extended(texts, model, tokenizer, typo_dict=typo_dict, strength=strength)
-
-    new_data = []
-    for original, new_item in zip(data, perturbed_texts):
-        new_entry = original.copy()
-        new_entry["text"] = new_item
-        new_data.append(new_entry)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(new_data, f, ensure_ascii=False, indent=2)
-
-    print(f"✅ 扰动完成！结果已保存至 {output_path}")
+    main()
