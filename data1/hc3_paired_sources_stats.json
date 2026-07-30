@@ -1,0 +1,37 @@
+{
+  "input_path": "/home/chy/1/data/all.jsonl",
+  "output_dir": "/home/chy/1/data/hc3_processed",
+  "min_chars": 100,
+  "max_chars": 800,
+  "min_sentences": 2,
+  "raw_records": 12853,
+  "valid_source_items": 13112,
+  "valid_topic_pairs": 6556,
+  "unique_topic_ids": 6556,
+  "skipped": {
+    "invalid_human": 4820,
+    "invalid_machine": 1191,
+    "duplicate_text": 286
+  },
+  "split": {
+    "train_topics": 4589,
+    "dev_topics": 655,
+    "test_topics": 1312,
+    "train_items": 9178,
+    "dev_items": 1310,
+    "test_items": 2624
+  },
+  "label_distribution_all": {
+    "human": 6556,
+    "machine": 6556
+  },
+  "domain_distribution_all": {
+    "open_qa": 3898,
+    "baike": 5334,
+    "nlpcc_dbqa": 164,
+    "finance": 352,
+    "medicine": 1358,
+    "psychology": 1946,
+    "law": 60
+  }
+}
